@@ -1,5 +1,6 @@
 import os
-import re
+import ast
+import operator
 import json
 import sys
 from pathlib import Path
@@ -18,13 +19,21 @@ from langgraph.prebuilt import create_react_agent
 from langchain_core.tools import tool
 from langchain_core.messages import SystemMessage
 # 使用 LangChain 内置的 Wikipedia 工具
-from langchain_community.tools import WikipediaQueryRun
-from langchain_community.utilities import WikipediaAPIWrapper
+# 直接从真实子模块导入（而不是包根的懒加载导出），避免 VSCode Pylance 静态分析误报红线
+from langchain_community.tools.wikipedia.tool import WikipediaQueryRun
+from langchain_community.utilities.wikipedia import WikipediaAPIWrapper
 
+
+# ========== 路径处理 ==========
+SCRIPT_DIR = Path(__file__).parent.resolve()
+PERSIST_DIR = str(SCRIPT_DIR / "chroma_db_agent")
+MEMORY_FILE = SCRIPT_DIR / "memory.json"          # 记忆存储文件
+DOC_PATH = (SCRIPT_DIR / "../company.txt").resolve()
 
 # ========== 配置 ==========
-load_dotenv()
-API_KEY = os.getenv("ZHIPU_API_KEY", "你的智谱API密钥")
+# 显式指定仓库根目录的 .env，无论从哪个目录启动脚本都能读到密钥
+load_dotenv(SCRIPT_DIR.parent / ".env")
+API_KEY = os.getenv("ZHIPU_API_KEY")
 if not API_KEY:
     print("❌ 错误：未找到 ZHIPU_API_KEY，请在 .env 文件中设置")
     sys.exit(1)
@@ -33,12 +42,6 @@ if not API_KEY:
 MODEL_NAME = "glm-4-flash"
 TEMPERATURE = 0
 
-
-# ========== 路径处理 ==========
-SCRIPT_DIR = Path(__file__).parent.resolve()
-PERSIST_DIR = str(SCRIPT_DIR / "chroma_db_agent")
-MEMORY_FILE = SCRIPT_DIR / "memory.json"          # 记忆存储文件
-DOC_PATH = (SCRIPT_DIR / "../company.txt").resolve()
 
 if not DOC_PATH.exists():
     print(f"❌ 错误：文档文件不存在：{DOC_PATH}")
@@ -60,13 +63,18 @@ print("📂 加载文档并创建向量库...")
 loader = TextLoader(str(DOC_PATH), encoding="utf-8")
 documents = loader.load()
 # 2. 将长文档切分成小块（chunk），便于检索
-test_splitter = RecursiveCharacterTextSplitter(chunk_size=500,chunk_overlap=50)
-chunks = test_splitter.split_documents(documents)
+text_splitter = RecursiveCharacterTextSplitter(chunk_size=500,chunk_overlap=50)
+chunks = text_splitter.split_documents(documents)
 
 # 3. 使用智谱 Embedding 模型将文本块向量化，并存入 Chroma 向量库（持久化到本地目录）
 embeddings = ZhipuAIEmbeddings(api_key=API_KEY,model="embedding-2")
-# 创建 Chroma 向量数据库，持久化到本地目录，以便后续复用
-vectorstore = Chroma.from_documents(chunks,embedding=embeddings,persist_directory=PERSIST_DIR)
+# 如果向量库已存在则直接加载，避免每次启动都重复写入全部文档块
+if os.path.exists(PERSIST_DIR):
+    vectorstore = Chroma(persist_directory=PERSIST_DIR, embedding_function=embeddings)
+    print("   已加载现有向量库")
+else:
+    vectorstore = Chroma.from_documents(chunks, embedding=embeddings, persist_directory=PERSIST_DIR)
+    print("   已创建新向量库")
 # 创建检索器，每次检索返回最相关的3个文档块
 retriever = vectorstore.as_retriever(search_kwargs={"k":3})
 
@@ -87,7 +95,7 @@ def search_company_docs(query: str) -> str:
 
 # ========== 工具2：Wikipedia（增强异常处理） ==========
 # 实例化原始工具
-_wikipedia_raw = WikipediaQueryRun(api_wrapper=WikipediaAPIWrapper())
+_wikipedia_raw = WikipediaQueryRun(api_wrapper=WikipediaAPIWrapper()) # type: ignore
 
 @tool
 def search_wikipedia(query: str) -> str:
@@ -103,18 +111,49 @@ def search_wikipedia(query: str) -> str:
 
 
 # ========== 工具3：计算器 ==========
+# 仅允许基础四则运算 + 取模 + 幂运算的白名单
+_ALLOWED_BINOPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+    ast.Pow: operator.pow,
+}
+_ALLOWED_UNARYOPS = {
+    ast.USub: operator.neg,
+    ast.UAdd: operator.pos,
+}
+
+def _safe_eval_node(node):
+    """递归求值 AST 节点，只接受数字和基础运算符，拒绝任何其他语法（变量、函数调用等）"""
+    if isinstance(node, ast.Expression):
+        return _safe_eval_node(node.body)
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return node.value
+    if isinstance(node, ast.BinOp) and type(node.op) in _ALLOWED_BINOPS:
+        left = _safe_eval_node(node.left)
+        right = _safe_eval_node(node.right)
+        # 限制幂运算的指数，防止 9**9**9 之类的天文数字把程序卡死
+        if isinstance(node.op, ast.Pow) and abs(right) > 1000:
+            raise ValueError("指数过大")
+        return _ALLOWED_BINOPS[type(node.op)](left, right)
+    if isinstance(node, ast.UnaryOp) and type(node.op) in _ALLOWED_UNARYOPS:
+        return _ALLOWED_UNARYOPS[type(node.op)](_safe_eval_node(node.operand))
+    raise ValueError("不支持的表达式")
+
 @tool
 def calculate(expression: str) -> str:
     """
     执行简单数学计算，输入为数学表达式，如 '2+3' 或 '10*5'。
     """
     try:
-        # 简单校验表达式只包含数字、运算符、括号、小数点、空格
-        if not re.match(r'^[\d+\-*/().\s]+$', expression):
-            return "仅支持基础四则运算。"
-        # 使用 eval 计算（注意安全风险，但仅限基础运算可接受）
-        result = eval(expression)
+        tree = ast.parse(expression, mode="eval")
+        result = _safe_eval_node(tree)
         return f"计算结果：{result}"
+    except ZeroDivisionError:
+        return "计算错误：除数不能为 0"
     except Exception as e:
         return f"计算错误：{str(e)}"
 
@@ -188,8 +227,9 @@ def main():
             print("💾 记忆已保存，再见！")
             break
         if user_input.lower() == "clear":
-            messages = []  # 清空记忆
-            print("🧹 记忆已清空（文件未删除，下次启动不会加载）\n")
+            messages = []  # 清空当前记忆
+            MEMORY_FILE.unlink(missing_ok=True)  # 同时删除记忆文件，下次启动才会真正从新对话开始
+            print("🧹 记忆已清空（会话与文件均已清除），下次启动从新对话开始\n")
             continue
         if not user_input.strip():
             continue
