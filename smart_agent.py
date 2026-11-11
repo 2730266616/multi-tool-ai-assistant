@@ -18,8 +18,7 @@ from langgraph.prebuilt import create_react_agent
 # LangChain 核心工具与消息
 from langchain_core.tools import tool
 from langchain_core.messages import SystemMessage
-# 使用 LangChain 内置的 Wikipedia 工具
-# 直接从真实子模块导入（而不是包根的懒加载导出），避免 VSCode Pylance 静态分析误报红线
+# 从子模块直接导入，避免 Pylance 对包根懒加载导出的误报
 from langchain_community.tools.wikipedia.tool import WikipediaQueryRun
 from langchain_community.utilities.wikipedia import WikipediaAPIWrapper
 
@@ -46,7 +45,7 @@ TEMPERATURE = 0
 
 if not PDF_PATH.exists():
     print(f"❌ 错误：文档文件不存在：{PDF_PATH}")
-    print("请确保 hr_policy.pdf 放在正确位置（默认在脚本的上一级目录）")
+    print("请确保 hr_policy.pdf 与 smart_agent.py 位于同一目录")
     sys.exit(1)
 
 print(f"📄 使用文档：{PDF_PATH}")
@@ -60,7 +59,7 @@ model = ChatZhipuAI(api_key=API_KEY, model= MODEL_NAME, temperature=TEMPERATURE)
 
 # ========== 准备 RAG 检索器（加载已有向量库或新建） ==========
 print("📂 正在加载企业级 PDF 文档...")
-# 注意替换为你下载的 PDF 文件路径
+# 1. 加载 PDF 文档
 loader = PyPDFLoader(str(PDF_PATH))
 documents = loader.load()
 
@@ -83,7 +82,7 @@ chunks = text_splitter.split_documents(documents)
 
 # 3. 使用智谱 Embedding 模型将文本块向量化，并存入 Chroma 向量库（持久化到本地目录）
 embeddings = ZhipuAIEmbeddings(api_key=API_KEY,model="embedding-2")
-# 如果向量库已存在则直接加载，避免每次启动都重复写入全部文档块
+# 索引版本管理：用 PDF mtime/size + 切分参数做签名，签名变化自动重建，避免旧索引污染
 def _index_signature():
     st = PDF_PATH.stat()
     return {"pdf_mtime": st.st_mtime, "pdf_size": st.st_size,
@@ -108,7 +107,7 @@ if _need_rebuild():
 else:
     vectorstore = Chroma(persist_directory=PERSIST_DIR, embedding_function=embeddings)
     print("   已加载现有向量库")
-# 创建检索器，每次检索返回最相关的3个文档块
+# 检索器：每次召回 Top5。k=3 时会漏掉被表格块挤掉的条款，扩到 5 兜住召回
 retriever = vectorstore.as_retriever(search_kwargs={"k":5})
 
 
@@ -197,7 +196,8 @@ tools = [search_company_docs, search_wikipedia, calculate]
 
 
 # ========== 创建 ReAct Agent ==========
-# 使用 LangGraph 的预置函数，将模型、工具列表和系统提示组装成 Agent
+# 使用 LangGraph 预置的 ReAct Agent 构建器
+# TODO(Day3): create_react_agent 在 LangGraph V1.0 已弃用，计划迁移到 langchain.agents.create_agent
 agent = create_react_agent(
     model,
     tools,
@@ -274,7 +274,7 @@ def main():
         # 将用户消息加入历史
         messages.append(("human", user_input))
 
-        # 【核心改动】滑动窗口截断：如果消息数超过阈值，只保留最近 N 轮
+        # 滑动窗口截断：消息数超过阈值时只保留最近 N 轮，防止上下文溢出
         # 例如：10 轮 = 20 条消息，保留最后 20 条
         max_messages = MAX_HISTORY_PAIRS * 2
         if len(messages) > max_messages:
