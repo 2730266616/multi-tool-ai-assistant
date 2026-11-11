@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 from langchain_community.chat_models import ChatZhipuAI
 from langchain_community.vectorstores import Chroma
 from langchain_community.embeddings import ZhipuAIEmbeddings
-from langchain_community.document_loaders import TextLoader
+from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 # LangGraph 相关：预置的 ReAct Agent 构建器
 from langgraph.prebuilt import create_react_agent
@@ -27,8 +27,9 @@ from langchain_community.utilities.wikipedia import WikipediaAPIWrapper
 # ========== 路径处理 ==========
 SCRIPT_DIR = Path(__file__).parent.resolve()
 PERSIST_DIR = str(SCRIPT_DIR / "chroma_db_agent")
+INDEX_META = SCRIPT_DIR / "index_meta.json"
 MEMORY_FILE = SCRIPT_DIR / "memory.json"          # 记忆存储文件
-DOC_PATH = (SCRIPT_DIR / "../company.txt").resolve()
+PDF_PATH = (SCRIPT_DIR / "hr_policy.pdf").resolve()
 
 # ========== 配置 ==========
 # 显式指定仓库根目录的 .env，无论从哪个目录启动脚本都能读到密钥
@@ -43,12 +44,12 @@ MODEL_NAME = "glm-4-flash"
 TEMPERATURE = 0
 
 
-if not DOC_PATH.exists():
-    print(f"❌ 错误：文档文件不存在：{DOC_PATH}")
-    print("请确保 company.txt 放在正确位置（默认在脚本的上一级目录）")
+if not PDF_PATH.exists():
+    print(f"❌ 错误：文档文件不存在：{PDF_PATH}")
+    print("请确保 hr_policy.pdf 放在正确位置（默认在脚本的上一级目录）")
     sys.exit(1)
 
-print(f"📄 使用文档：{DOC_PATH}")
+print(f"📄 使用文档：{PDF_PATH}")
 print(f"💾 记忆文件：{MEMORY_FILE}")
 
 
@@ -58,39 +59,72 @@ model = ChatZhipuAI(api_key=API_KEY, model= MODEL_NAME, temperature=TEMPERATURE)
 
 
 # ========== 准备 RAG 检索器（加载已有向量库或新建） ==========
-print("📂 加载文档并创建向量库...")
-# 1. 加载本地公司文档（假设存在 ../company.txt）
-loader = TextLoader(str(DOC_PATH), encoding="utf-8")
+print("📂 正在加载企业级 PDF 文档...")
+# 注意替换为你下载的 PDF 文件路径
+loader = PyPDFLoader(str(PDF_PATH))
 documents = loader.load()
+
+suspicious = []
+for d in documents:
+    text = d.page_content or ""
+    bad_ratio = text.count("\ufffd") / max(len(text), 1)
+    if len(text.strip()) < 50 or bad_ratio > 0.02:
+        suspicious.append({"page": d.metadata.get("page", -1) + 1,
+                           "chars": len(text), "bad_ratio": round(bad_ratio, 3)})
+print(f"[PDF质量] 共 {len(documents)} 页，可疑页: {suspicious}")
+
 # 2. 将长文档切分成小块（chunk），便于检索
-text_splitter = RecursiveCharacterTextSplitter(chunk_size=500,chunk_overlap=50)
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=400,
+    chunk_overlap=100,
+    separators=["\n\n", "\n", "。", "；", "，", " ", ""],
+)
 chunks = text_splitter.split_documents(documents)
 
 # 3. 使用智谱 Embedding 模型将文本块向量化，并存入 Chroma 向量库（持久化到本地目录）
 embeddings = ZhipuAIEmbeddings(api_key=API_KEY,model="embedding-2")
 # 如果向量库已存在则直接加载，避免每次启动都重复写入全部文档块
-if os.path.exists(PERSIST_DIR):
+def _index_signature():
+    st = PDF_PATH.stat()
+    return {"pdf_mtime": st.st_mtime, "pdf_size": st.st_size,
+            "chunk_size": 400, "chunk_overlap": 100}
+
+def _need_rebuild():
+    if not os.path.exists(PERSIST_DIR) or not INDEX_META.exists():
+        return True
+    try:
+        return json.loads(INDEX_META.read_text(encoding="utf-8")) != _index_signature()
+    except json.JSONDecodeError:
+        return True
+    
+if _need_rebuild():
+    if os.path.exists(PERSIST_DIR):
+        import shutil
+        shutil.rmtree(PERSIST_DIR)
+        print("   ⚠️ 检测到 PDF/切分参数变化，重建向量库")
+    vectorstore = Chroma.from_documents(chunks, embedding=embeddings, persist_directory=PERSIST_DIR)
+    INDEX_META.write_text(json.dumps(_index_signature(), ensure_ascii=False), encoding="utf-8")
+    print("   已创建新向量库")
+else:
     vectorstore = Chroma(persist_directory=PERSIST_DIR, embedding_function=embeddings)
     print("   已加载现有向量库")
-else:
-    vectorstore = Chroma.from_documents(chunks, embedding=embeddings, persist_directory=PERSIST_DIR)
-    print("   已创建新向量库")
 # 创建检索器，每次检索返回最相关的3个文档块
-retriever = vectorstore.as_retriever(search_kwargs={"k":3})
+retriever = vectorstore.as_retriever(search_kwargs={"k":5})
 
 
 # ========== 工具1：公司文档检索（RAG） ==========
 @tool
 def search_company_docs(query: str) -> str:
     """
-    从公司文档中检索相关信息。
-    适用于公司介绍、业务、人员等问题。
+    从公司内部文档中检索信息，适用于社保政策、缴纳比例、报销流程、HR 制度等。
     """
     docs = retriever.invoke(query)  # 调用检索器获取相关文档
     if not docs:
         return "未找到相关信息。"
     # 将多个文档内容拼接返回
-    return "\n\n".join([d.page_content for d in docs])
+    return "\n\n".join(
+        f"【来源·第{d.metadata.get('page', 0) + 1}页】\n{d.page_content}" for d in docs
+    )
 
 
 # ========== 工具2：Wikipedia（增强异常处理） ==========
@@ -173,6 +207,9 @@ agent = create_react_agent(
         "2. search_wikipedia：查询百科知识（即 Wikipedia 工具）\n"
         "3. calculate：执行数学计算\n"
         "根据用户问题，自主选择最合适的工具。如果问题可以直接回答，不需要工具。"
+        "\n当用户询问社保比例/缴费标准时，必须覆盖：养老、医疗、失业、工伤、生育五险及住房公积金，不得遗漏。"
+        "\n引用 search_company_docs 的内容时，每一条事实后面必须紧跟来源标注，格式为【来源·第X页】。"
+        "\n示例：基本养老保险：单位16%，个人8%【来源·第1页】"
     )
 )
 
@@ -242,6 +279,8 @@ def main():
         max_messages = MAX_HISTORY_PAIRS * 2
         if len(messages) > max_messages:
             messages = messages[-max_messages:]
+            while messages and messages[0][0] != "human":
+                messages = messages[1:]
             print(f"🔄 记忆已滑动至最近 {MAX_HISTORY_PAIRS} 轮")
 
         # 调用 Agent，传入完整历史
