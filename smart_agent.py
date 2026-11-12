@@ -1,3 +1,4 @@
+import re
 import os
 import ast
 import operator
@@ -112,15 +113,31 @@ retriever = vectorstore.as_retriever(search_kwargs={"k":5})
 
 
 # ========== 工具1：公司文档检索（RAG） ==========
+SIMILARITY_THRESHOLD = 1.10  # L2 距离，> 该值视为无足够相关内容
+# 依据 Day2 实测：有答案的 query 约 0.82~1.05，无答案约 1.28+，取 1.10 分界。
+# 注意：此值随文档、embedding 模型、query 改写波动，换文档必须重新诊断。
+
 @tool
 def search_company_docs(query: str) -> str:
     """
-    从公司内部文档中检索信息，适用于社保政策、缴纳比例、报销流程、HR 制度等。
+    从公司内部文档中检索信息。凡涉及公司内部制度的问题都必须用此工具，
+    包括但不限于：社保、公积金（含提取/缴纳/贷款/比例）、缴费比例、报销流程、
+    考勤、假期、薪酬、入职离职、工伤申报、生育待遇、劳动合同、HR 制度等。
+    不要用 search_wikipedia 回答公司制度类问题。
     """
-    docs = retriever.invoke(query)  # 调用检索器获取相关文档
-    if not docs:
-        return "未找到相关信息。"
-    # 将多个文档内容拼接返回
+    docs_with_scores = vectorstore.similarity_search_with_score(query, k=5)
+    if not docs_with_scores:
+        return "未在公司文档中找到相关内容，请拨打 HR 分机 8001 咨询。"
+
+    best_score = docs_with_scores[0][1]
+    print(f"[检索] best={best_score:.4f} | {query}")  # 调试用，上线可删
+
+    if best_score > SIMILARITY_THRESHOLD:
+        return ("【系统指令】文档无相关内容。你必须原样回复："
+                "未在公司文档中找到足够相关的内容，请拨打 HR 分机 8001 咨询。"
+                "禁止输出任何步骤、建议或通用知识。")
+
+    docs = [d for d, _ in docs_with_scores]
     return "\n\n".join(
         f"【来源·第{d.metadata.get('page', 0) + 1}页】\n{d.page_content}" for d in docs
     )
@@ -208,8 +225,13 @@ agent = create_react_agent(
         "3. calculate：执行数学计算\n"
         "根据用户问题，自主选择最合适的工具。如果问题可以直接回答，不需要工具。"
         "\n当用户询问社保比例/缴费标准时，必须覆盖：养老、医疗、失业、工伤、生育五险及住房公积金，不得遗漏。"
-        "\n引用 search_company_docs 的内容时，每一条事实后面必须紧跟来源标注，格式为【来源·第X页】。"
-        "\n示例：基本养老保险：单位16%，个人8%【来源·第1页】"
+        "\n【最高优先级·仅限 RAG 拒答场景】仅当 search_company_docs 返回包含‘请拨打 HR 分机 8001’的内容时，"
+        "你的回复必须且只能是：‘未在公司文档中找到足够相关的内容，请拨打 HR 分机 8001 咨询。’"
+        "此时禁止补充任何步骤、建议、列表或通用知识。"
+        "其他工具（Wikipedia、计算器）不受此规则限制。"
+        "\n【工具选择规则】社保、公积金、缴费、报销、考勤、假期、薪酬、入职离职、工伤、"
+        "生育、劳动合同、HR 制度等公司内部事务，必须使用 search_company_docs，不得使用 search_wikipedia。"
+        "search_wikipedia 仅用于与公司无关的通用百科知识（人物、历史、科学概念等）。"
     )
 )
 
@@ -235,6 +257,15 @@ def load_memory():
         print("⚠️ 记忆文件损坏，将开始新对话")
         return []
 
+# ========== 提取来源页码函数 ==========
+def extract_sources(result) -> list[int]:
+    """从 Agent 执行产生的 ToolMessage 中提取真实页码，去重排序"""
+    pages = set()
+    for m in result["messages"]:
+        if getattr(m, "type", "") == "tool":
+            content = m.content if isinstance(m.content, str) else ""
+            pages.update(int(p) for p in re.findall(r"【来源·第(\d+)页】", content))
+    return sorted(pages)
 
 # ========== 交互循环 ==========
 def main():
@@ -286,11 +317,22 @@ def main():
         # 调用 Agent，传入完整历史
         result = agent.invoke({"messages": messages})
         final_message = result["messages"][-1]
+        answer = final_message.content
 
-        # 将 AI 回复加入历史
-        messages.append(("ai", final_message.content))
+        # 硬兜底：工具已触发拒答，但 LLM 仍输出长段落 = 在编造，强制替换
+        _tool_refused = any(
+            "请拨打 HR 分机 8001" in (m.content if isinstance(m.content, str) else "")
+            for m in result["messages"] if getattr(m, "type", "") == "tool"
+        )
+        if _tool_refused and answer.count("\n") > 3:
+            answer = "未在公司文档中找到足够相关的内容，请拨打 HR 分机 8001 咨询。"
 
-        print(f"AI: {final_message.content}\n")
+        sources = extract_sources(result)
+        if sources:
+            answer += f"\n\n参考来源：第{'、'.join(map(str, sources))}页"
+
+        messages.append(("ai", answer))
+        print(f"AI: {answer}\n")
 
 if __name__ == "__main__":
     main()
