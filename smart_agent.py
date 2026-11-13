@@ -222,17 +222,16 @@ agent = create_react_agent(
         content="你是一个智能助手，可以使用以下工具：\n"
         "1. search_company_docs：查询公司内部文档\n"
         "2. search_wikipedia：查询百科知识（即 Wikipedia 工具）\n"
-        "3. calculate：执行数学计算\n"
-        "\n【最高优先级规则】凡涉及公司内部制度、社保、公积金、缴费比例、金额等业务问题，"
-        "必须强制调用 search_company_docs 工具检索，绝不允许使用你自己的通用知识直接回答！"
-        "\n当用户询问社保比例/缴费标准时，必须覆盖：养老、医疗、失业、工伤、生育五险及住房公积金，不得遗漏。"
-        "\n【最高优先级·仅限 RAG 拒答场景】仅当 search_company_docs 返回包含‘请转人工咨询’的内容时，"
-        "你的回复必须且只能是：‘未在公司文档中找到足够相关的内容，请转人工咨询。’"
-        "此时禁止补充任何步骤、建议、列表或通用知识。"
-        "其他工具（Wikipedia、计算器）不受此规则限制。"
-        "\n【工具选择规则】社保、公积金、缴费、报销、考勤、假期、薪酬、入职离职、工伤、"
-        "生育、劳动合同、HR 制度等公司内部事务，必须使用 search_company_docs，不得使用 search_wikipedia。"
-        "search_wikipedia 仅用于与公司无关的通用百科知识（人物、历史、科学概念等）。"
+        "3. calculate：执行数学计算\n\n"
+        "【最高优先级业务规则】\n"
+        "1. 凡涉及公司内部制度（社保、公积金、缴费比例、金额、考勤、薪酬等），必须强制调用 search_company_docs 检索，绝不允许使用通用知识直接回答！\n"
+        "2. 当询问社保比例时，必须覆盖：养老、医疗、失业、工伤、生育及住房公积金，不得遗漏。\n"
+        "3. 【严格状态隔离】无论历史记录中是否包含相似信息，只要用户发起了新提问，必须重新调用 search_company_docs 检索，严禁复用历史上下文。\n\n"
+        "【工具选择边界】\n"
+        "社保、公积金等公司业务，只准用 search_company_docs；\n"
+        "search_wikipedia 仅限人物、历史、科学概念等无关公司的百科知识。\n\n"
+        "【拒答兜底机制】\n"
+        "仅当 search_company_docs 返回包含‘请转人工咨询’的内容时，你的回复必须且只能是：‘未在公司文档中找到足够相关的内容，请转人工咨询。’此时禁止输出任何建议或步骤。其他工具不受此规则限制。"
     )
 )
 
@@ -260,14 +259,15 @@ def load_memory():
 
 # ========== 提取来源页码函数 ==========
 def extract_sources(result) -> list[int]:
-    """从最后一次 search_company_docs 的 ToolMessage 中提取页码，避免多轮检索导致来源膨胀"""
-    last_tool_content = ""
-    for m in result["messages"]:
+    """只提取当前轮对话（最后一个 Human 消息之后）的 ToolMessage 页码，防止历史来源串台"""
+    pages = set()
+    # 倒序遍历，遇到 human 消息就停止，保证只拿当前轮的
+    for m in reversed(result["messages"]):
+        if getattr(m, "type", "") == "human":
+            break
         if getattr(m, "type", "") == "tool":
             content = m.content if isinstance(m.content, str) else ""
-            if "【来源·第" in content:          # 只认 RAG 工具的返回，跳过 Wikipedia/计算器
-                last_tool_content = content
-    pages = {int(p) for p in re.findall(r"【来源·第(\d+)页】", last_tool_content)}
+            pages.update(int(p) for p in re.findall(r"【来源·第(\d+)页】", content))
     return sorted(pages)
 
 # ========== 交互循环 ==========
@@ -318,7 +318,8 @@ def main():
             print(f"🔄 记忆已滑动至最近 {MAX_HISTORY_PAIRS} 轮")
 
         # 调用 Agent，传入完整历史
-        result = agent.invoke({"messages": messages})
+        # 限制最多思考 6 步（即最多调用 2~3 次工具），防止反复纠结
+        result = agent.invoke({"messages": messages}, config={"recursion_limit": 6})
         final_message = result["messages"][-1]
         answer = final_message.content
         # 空回复兜底
