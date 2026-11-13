@@ -223,7 +223,8 @@ agent = create_react_agent(
         "1. search_company_docs：查询公司内部文档\n"
         "2. search_wikipedia：查询百科知识（即 Wikipedia 工具）\n"
         "3. calculate：执行数学计算\n"
-        "根据用户问题，自主选择最合适的工具。如果问题可以直接回答，不需要工具。"
+        "\n【最高优先级规则】凡涉及公司内部制度、社保、公积金、缴费比例、金额等业务问题，"
+        "必须强制调用 search_company_docs 工具检索，绝不允许使用你自己的通用知识直接回答！"
         "\n当用户询问社保比例/缴费标准时，必须覆盖：养老、医疗、失业、工伤、生育五险及住房公积金，不得遗漏。"
         "\n【最高优先级·仅限 RAG 拒答场景】仅当 search_company_docs 返回包含‘请转人工咨询’的内容时，"
         "你的回复必须且只能是：‘未在公司文档中找到足够相关的内容，请转人工咨询。’"
@@ -326,7 +327,7 @@ def main():
 
         # 硬兜底：工具已触发拒答，但 LLM 仍输出长段落 = 在编造，强制替换
         _tool_refused = any(
-            "请拨打 HR 分机 8001" in (m.content if isinstance(m.content, str) else "")
+            "请转人工咨询" in (m.content if isinstance(m.content, str) else "")
             for m in result["messages"] if getattr(m, "type", "") == "tool"
         )
         if _tool_refused and answer.count("\n") > 3:
