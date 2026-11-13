@@ -127,14 +127,14 @@ def search_company_docs(query: str) -> str:
     """
     docs_with_scores = vectorstore.similarity_search_with_score(query, k=5)
     if not docs_with_scores:
-        return "未在公司文档中找到相关内容，请拨打 HR 分机 8001 咨询。"
+        return "未在公司文档中找到相关内容，请转人工咨询。"
 
     best_score = docs_with_scores[0][1]
     print(f"[检索] best={best_score:.4f} | {query}")  # 调试用，上线可删
 
     if best_score > SIMILARITY_THRESHOLD:
         return ("【系统指令】文档无相关内容。你必须原样回复："
-                "未在公司文档中找到足够相关的内容，请拨打 HR 分机 8001 咨询。"
+                "未在公司文档中找到足够相关的内容，请转人工咨询。"
                 "禁止输出任何步骤、建议或通用知识。")
 
     docs = [d for d, _ in docs_with_scores]
@@ -225,8 +225,8 @@ agent = create_react_agent(
         "3. calculate：执行数学计算\n"
         "根据用户问题，自主选择最合适的工具。如果问题可以直接回答，不需要工具。"
         "\n当用户询问社保比例/缴费标准时，必须覆盖：养老、医疗、失业、工伤、生育五险及住房公积金，不得遗漏。"
-        "\n【最高优先级·仅限 RAG 拒答场景】仅当 search_company_docs 返回包含‘请拨打 HR 分机 8001’的内容时，"
-        "你的回复必须且只能是：‘未在公司文档中找到足够相关的内容，请拨打 HR 分机 8001 咨询。’"
+        "\n【最高优先级·仅限 RAG 拒答场景】仅当 search_company_docs 返回包含‘请转人工咨询’的内容时，"
+        "你的回复必须且只能是：‘未在公司文档中找到足够相关的内容，请转人工咨询。’"
         "此时禁止补充任何步骤、建议、列表或通用知识。"
         "其他工具（Wikipedia、计算器）不受此规则限制。"
         "\n【工具选择规则】社保、公积金、缴费、报销、考勤、假期、薪酬、入职离职、工伤、"
@@ -259,12 +259,14 @@ def load_memory():
 
 # ========== 提取来源页码函数 ==========
 def extract_sources(result) -> list[int]:
-    """从 Agent 执行产生的 ToolMessage 中提取真实页码，去重排序"""
-    pages = set()
+    """从最后一次 search_company_docs 的 ToolMessage 中提取页码，避免多轮检索导致来源膨胀"""
+    last_tool_content = ""
     for m in result["messages"]:
         if getattr(m, "type", "") == "tool":
             content = m.content if isinstance(m.content, str) else ""
-            pages.update(int(p) for p in re.findall(r"【来源·第(\d+)页】", content))
+            if "【来源·第" in content:          # 只认 RAG 工具的返回，跳过 Wikipedia/计算器
+                last_tool_content = content
+    pages = {int(p) for p in re.findall(r"【来源·第(\d+)页】", last_tool_content)}
     return sorted(pages)
 
 # ========== 交互循环 ==========
@@ -318,6 +320,9 @@ def main():
         result = agent.invoke({"messages": messages})
         final_message = result["messages"][-1]
         answer = final_message.content
+        # 空回复兜底
+        if not answer or not answer.strip():
+            answer = "抱歉，我暂时没能生成回复，请重试或换一种问法。"
 
         # 硬兜底：工具已触发拒答，但 LLM 仍输出长段落 = 在编造，强制替换
         _tool_refused = any(
@@ -325,7 +330,7 @@ def main():
             for m in result["messages"] if getattr(m, "type", "") == "tool"
         )
         if _tool_refused and answer.count("\n") > 3:
-            answer = "未在公司文档中找到足够相关的内容，请拨打 HR 分机 8001 咨询。"
+            answer = "未在公司文档中找到足够相关的内容，请转人工咨询。"
 
         sources = extract_sources(result)
         if sources:
