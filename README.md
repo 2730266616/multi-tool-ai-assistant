@@ -1,189 +1,126 @@
-# 🤖 多工具智能助手（Multi-Tool AI Assistant）
+# 基于 RAG 的企业级复杂文档解析与检索 Agent (LangGraph)
 
-> 基于 LangGraph 构建的智能 Agent，具备自主决策、多工具调用、多轮对话记忆与持久化存储能力。
+> 面向企业级复杂文档（如 Datasheet、政策手册等）的智能问答系统。基于 LangGraph 多工具路由架构，提供高精度 RAG 检索、L2 阈值拦截、三层防幻觉兜底与源码级页码溯源能力。
 
----
+## 项目背景与简介
 
-## 📖 项目简介
+在企业级场景（如硬件 Datasheet 提参、公司制度查询）中，大模型的“幻觉”是不可接受的。单纯堆砌 Prompt 无法解决复杂文档切分、工具路由错乱及恶意编造等问题。
 
-本项目是一个基于 **LangGraph** 框架开发的命令行智能助手，能够根据用户问题的类型**自主决策**调用最合适的工具：
+本项目基于 LangGraph 开发，采用 ReAct 架构，支持 CLI 与 Streamlit Web 双端运行。除了常规的 RAG、百科与计算器工具外，项目重点攻克了检索边界判定与防幻觉拦截，确保系统在遇到无答案的问题时“敢拒答”，在面对有效问题时“答得准、可溯源”。
 
-- **RAG 文档检索**：基于公司内部文档进行精准问答（支持私有知识库）
-- **Wikipedia 百科查询**：获取人物、概念、历史事件等事实信息
-- **数学计算器**：支持基础四则运算
+## 核心特性
 
-同时，系统具备**多轮对话记忆**能力，并能通过 **JSON 持久化** 存储对话历史，即使重启程序也能恢复上下文。
+| 模块 | 亮点描述 |
+|------|----------|
+| 三层防幻觉架构 | Prompt 软约束 + 工具返回强指令 + 代码层硬兜底检测（拦截大模型盲目编造） |
+| L2 距离阈值拦截 | 基于真实分数分布（0.82~1.28）设定阈值（1.10），低相关度直接触发拒答转人工 |
+| 程序化页码溯源 | 不依赖大模型自觉，通过正则提取 ToolMessage 元数据，精准定位原文页码 |
+| 工具路由纠正 | 穷举业务场景完善 Tool Docstring，解决 Agent 将公司制度误路由至 Wikipedia 的问题 |
+| 索引签名自动重建 | 通过 PDF 的 mtime、size 及切分参数生成签名，参数变化自动重建 Chroma 向量库 |
+| 双端交互支持 | 提供 CLI 命令行交互，以及基于 Streamlit 的专业 Web 对话界面 |
+| 滑动窗口记忆 | 维护多轮对话上下文，自动裁剪至最近 10 轮，防止 Token 溢出 |
 
----
+## 技术栈
 
-## ✨ 核心功能
+- 核心框架：LangChain, LangGraph (ReAct Agent)
+- 大语言模型：智谱 AI glm-4-flash (Temp=0)
+- 向量与 Embedding：智谱 embedding-2 + Chroma 本地向量库
+- 文档解析：PyPDFLoader (带页级乱码与文本质量检测)
+- UI 框架：Streamlit
+- 开发语言：Python 3.12
 
-| 功能 | 说明 |
-|------|------|
-| 🧠 **自主决策** | 使用 ReAct 模式，Agent 自动判断问题类型并选择工具 |
-| 📄 **RAG 检索** | 基于 Chroma 向量数据库 + 智谱 Embedding，精准检索私有文档 |
-| 📚 **百科查询** | 集成 Wikipedia API，支持中英文百科知识检索 |
-| 🧮 **数学计算** | 支持基础四则运算表达式（如 `25*4+10`） |
-| 💬 **多轮记忆** | 维护完整对话历史，支持上下文连续对话 |
-| 💾 **持久化存储** | 对话历史自动保存到 `memory.json`，重启后自动加载 |
-| 🔄 **滑动窗口** | 自动裁剪超长对话，避免上下文溢出（默认保留最近 10 轮） |
-| 🧹 **会话管理** | 支持 `clear` 命令清空当前记忆 |
+## 架构与工程设计
 
----
+### 1. 检索与防幻觉链路
+```text
+用户提问 
+  ↓ 
+Agent 意图识别 (ReAct)
+  ↓
+调用 search_company_docs 工具 (Chroma 检索)
+  ↓
+判断 Top1 L2 距离是否 > 1.10 ? 
+  ├── 是 (拒答) → 返回系统强指令 → LLM 拒绝回答
+  │                              ↓ (代码硬兜底检测)
+  │                        若 LLM 仍编造 → 强制替换为人工客服话术
+  └── 否 (放行) → 注入带【来源·第X页】的上下文 → LLM 生成回答
+                                                 ↓
+                                           正则提取页码并展示
+```
 
-## 🛠️ 技术栈
+### 2. 复杂文档预处理流水线
+- 页级质量检测：统计 PDF 页面替换字符率（`\ufffd`）与文本长度，标记疑似乱码/空页。
+- 中文语义切分：使用 `RecursiveCharacterTextSplitter` 针对中文标点（`。`、`；`）进行优化，设 `chunk_size=400, overlap=100`，避免条款标题与数值被切断。
 
-| 类别 | 技术 |
-|------|------|
-| **框架** | LangChain, LangGraph |
-| **大模型** | 智谱 AI（ChatGLM）`glm-4-flash` |
-| **嵌入模型** | 智谱 `embedding-2` |
-| **向量数据库** | Chroma（本地持久化） |
-| **工具集成** | Wikipedia API, RAG 检索, 计算器 |
-| **开发语言** | Python 3.12 |
-| **环境管理** | Python venv + pip |
+## 快速开始
 
----
-
-## 📦 安装与运行
-
-### 1. 克隆项目
+### 1. 克隆项目与安装依赖
 ```bash
-git clone git@github.com:2730266616/multi-tool-ai-assistant.git
+git clone <你的GitHub仓库地址>
 cd multi-tool-ai-assistant
-```
-
-### 2. 创建并激活虚拟环境
-```bash
-python3 -m venv venv
-source venv/bin/activate  # Linux/Mac
-# 或 venv\Scripts\activate  # Windows
-```
-
-### 3. 安装依赖
-```bash
+python3 -m venv graph_env
+source graph_env/bin/activate
 pip install -r requirements.txt
 ```
 
-### 4. 配置 API 密钥
+### 2. 配置环境变量
 在项目根目录创建 `.env` 文件：
 ```bash
 ZHIPU_API_KEY=你的智谱API密钥
 ```
 
-> ⚠️ **注意**：`.env` 文件已加入 `.gitignore`，不会上传到 GitHub，请勿在代码中硬编码密钥。
+### 3. 准备测试文档
+将你的测试 PDF 文件命名为 `hr_policy.pdf`，放置在项目根目录。系统首次运行会自动解析并构建向量库。
 
-### 5. 准备测试文档
-确保 `../company.txt` 文件存在（默认路径），内容示例：
+### 4. 启动应用
+
+方式一：Streamlit Web 界面（推荐）
+```bash
+streamlit run app.py
 ```
-公司名称：云创科技
-成立时间：2018年
-主营业务：人工智能与大数据解决方案
-员工人数：120人
-总部地址：上海市浦东新区
-创始人：李明
-融资情况：2022年完成B轮融资1亿元
-```
+打开浏览器访问 `http://localhost:8501` 即可进行交互。
 
-> 如需修改文档路径，请修改 `smart_agent.py` 中的 `DOC_PATH` 变量。
-
-### 6. 运行项目
+方式二：CLI 命令行模式
 ```bash
 python smart_agent.py
 ```
 
----
+## 回归测试用例（诊断证据）
 
-## 🧪 使用示例
+项目内置了严格的回归测试标准，以验证防幻觉与路由机制是否生效：
+
+| 测试场景 | 输入示例 | 预期表现 |
+|---------|---------|---------|
+| 正常RAG | `社保缴纳比例` | 输出五险一金比例，底部展示溯源定位页码（如：第 1、2、3 页） |
+| 阈值拒答 | `住房公积金怎么提取` | 触发 L2 拦截（>1.10），输出系统拦截提示并转接人工咨询 |
+| 路由纠正 | `什么是人工智能` | 正确调用 Wikipedia，而非走内部文档 RAG |
+| 代码硬兜底 | 复杂拒答场景 | 若 LLM 无视工具拒答强行输出步骤，代码层将其强制覆盖为拒绝回复 |
+
+## 项目结构
 
 ```text
-你: 公司主营业务是什么？
-AI: 根据公司文档，主营业务是人工智能与大数据解决方案...
-
-你: 什么是人工智能？
-AI: 来自 Wikipedia：人工智能是...
-
-你: 25*4+10 等于多少？
-AI: 计算结果：110
-
-你: 我叫小明
-AI: 你好小明！
-
-你: 我叫什么名字？
-AI: 你刚才说你叫小明。
-```
-
----
-
-## 📁 项目结构
-
-```
 .
-├── smart_agent.py          # 主程序（Agent 核心逻辑）
-├── .gitignore              # Git 忽略配置
-├── .env                    # API 密钥（不提交）
-├── requirements.txt        # Python 依赖清单
-├── README.md               # 项目说明文档
-├── memory.json             # 记忆持久化文件（自动生成）
-└── chroma_db_agent/        # Chroma 向量数据库（自动生成）
-    └── ...
+├── app.py                  # Streamlit Web 界面
+├── smart_agent.py          # Agent 核心逻辑与 CLI 入口
+├── hr_policy.pdf           # 测试 PDF 文档
+├── index_meta.json         # 向量库签名文件（自动生成）
+├── memory.json             # CLI 记忆持久化（自动生成）
+├── chroma_db_agent/        # 向量数据库持久化目录
+├── requirements.txt        # 依赖清单
+└── README.md
 ```
 
----
+## 针对企业级 Datasheet 场景的扩展规划 (Future Work)
 
-## 🔧 核心设计亮点
+1. 表格与多模态解析：引入 `pdfplumber` 或 `LlamaParse` 将复杂表格转为 Markdown；针对图纸/引脚图引入 OCR/VLM 做图文联合提取。
+2. 结构化提参校验：提取的器件参数需通过 Pydantic 等 Schema 校验后入库，彻底阻断模型胡乱生成未提取的参数。
+3. 自定义 StateGraph 优化延迟：用自定义图替代完全自主的 ReAct 循环，对明确意图走“检索-生成”短路架构，降低多轮往返耗时。
+4. 意图分流与鉴权：根据用户角色（部门）在 Chroma 检索前注入 Metadata Filter，实现行级权限控制。
 
-### 1. 工具封装（Tool Abstraction）
-每个工具使用 `@tool` 装饰器封装，包含清晰的 **名称、描述、输入参数类型**，方便 Agent 理解并调用。
+## 作者
 
-### 2. ReAct Agent 架构
-使用 LangGraph 的 `create_react_agent` 预置构建器，实现 **思考 → 行动 → 观察** 的自主循环，Agent 能够：
-- 分析用户问题
-- 决定是否调用工具及调用哪个工具
-- 根据工具返回结果生成最终回答
+- GitHub: [@2730266616](https://github.com/2730266616)
 
-### 3. 对话记忆与持久化
-- 维护 `messages` 列表，存储完整对话历史
-- 启动时从 `memory.json` 加载历史
-- 退出时自动保存到 `memory.json`
-- 支持 `clear` 命令清空记忆
-
-### 4. 滑动窗口机制
-当对话超过 **10 轮（20 条消息）** 时，自动裁剪早期历史，防止上下文溢出（Context Overflow），确保模型在有限的上下文窗口内始终保持最佳性能。
-
----
-
-## 🔮 未来优化方向
-
-- [ ] 接入更多工具（搜索引擎、天气 API、新闻 API）
-- [ ] 使用 LangGraph `checkpointer` 实现更优雅的持久化（支持时间旅行）
-- [ ] 支持多 Agent 协作（规划 Agent + 执行 Agent）
-- [ ] 添加 Web 界面（Streamlit / Gradio）
-- [ ] 支持多种文档格式（PDF、Word、Markdown）
-
----
-
-## 📄 许可证
-
+## 许可证
 本项目采用 MIT 许可证，详见 [LICENSE](LICENSE) 文件。
-
----
-
-## 👨‍💻 作者
-
-- GitHub: [2730266616](https://github.com/2730266616)
-- 邮箱: 2730266616@qq.com
-
----
-
-## 🙏 致谢
-
-- [LangChain](https://www.langchain.com/) & [LangGraph](https://langchain-ai.github.io/langgraph/)
-- [智谱 AI](https://open.bigmodel.cn/) 提供大模型与嵌入 API
-- [Wikipedia](https://www.wikipedia.org/) 提供百科数据
-
----
-
-> 📌 **项目演示**：如有任何问题或建议，欢迎提交 Issue 或 Pull Request！
-
 
